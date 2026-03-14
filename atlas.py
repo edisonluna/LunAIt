@@ -1,18 +1,23 @@
 """
 Atlas — Microsoft Technical and Solutions Architect Agent
-Uses the Anthropic SDK with Microsoft Learn tools to answer
-architecture and infrastructure questions grounded in official
-Microsoft documentation.
+
+Uses the Anthropic SDK with the official Microsoft Learn MCP connector to answer
+architecture and infrastructure questions grounded in official Microsoft documentation.
+
+The Microsoft Learn MCP server exposes three tools automatically:
+  - microsoft_docs_search
+  - microsoft_docs_fetch
+  - microsoft_code_sample_search
+
+Queries about existing Azure resources/tenant configuration are delegated to
+the ATM&A (Azure Tenant Management and Administration) agent stub.
 """
 
-import json
 import os
 import sys
 from pathlib import Path
 
 import anthropic
-import requests
-from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -21,268 +26,105 @@ from bs4 import BeautifulSoup
 MODEL = "claude-opus-4-6"
 MAX_TOKENS = 8192
 SYSTEM_PROMPT_FILE = Path(__file__).parent / "Atlas_Agent_Instructions.txt"
+MAX_AGENTIC_ITERATIONS = 15
 
-MS_LEARN_SEARCH_URL = "https://learn.microsoft.com/api/search"
-MS_LEARN_SEARCH_API_VERSION = "2.0"
-
-# ---------------------------------------------------------------------------
-# Tool definitions
-# ---------------------------------------------------------------------------
-
-TOOLS = [
+# Microsoft Learn MCP server — publicly available, no authentication required
+MCP_SERVERS = [
     {
-        "name": "microsoft_docs_search",
-        "description": (
-            "Search the official Microsoft Learn documentation. "
-            "Use this FIRST for every technical question involving Microsoft or Azure products. "
-            "Returns a list of relevant documentation pages with titles, URLs, and descriptions."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query for Microsoft documentation.",
-                },
-                "locale": {
-                    "type": "string",
-                    "description": "Locale for the search results (default: en-us).",
-                    "default": "en-us",
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "microsoft_docs_fetch",
-        "description": (
-            "Fetch the full content of a Microsoft Learn documentation page. "
-            "Use AFTER microsoft_docs_search when you need full step-by-step procedures, "
-            "complete architecture guidance, troubleshooting sections, or when the search "
-            "excerpt was truncated. Always fetch before providing deployment commands, "
-            "Bicep/ARM code, or multi-step configuration guidance."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "The full URL of the Microsoft Learn page to fetch.",
-                },
-            },
-            "required": ["url"],
-        },
-    },
-    {
-        "name": "microsoft_code_sample_search",
-        "description": (
-            "Search for official Microsoft/Azure code samples. "
-            "Use EVERY TIME you generate or reference Microsoft/Azure code. "
-            "Run this BEFORE writing any code snippet — retrieve official samples first, "
-            "then adapt to the user's scenario. Never write Azure CLI, PowerShell, Bicep, "
-            "ARM, or SDK code from memory alone."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query for Microsoft/Azure code samples.",
-                },
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "delegate_to_atma",
-        "description": (
-            "Delegate a question to the ATM&A (Azure Tenant Management and Administration) agent. "
-            "Use this when the request involves: existing Azure resources already deployed in a tenant, "
-            "tenant-wide or subscription-wide governance and policy impact, RBAC/permissions on existing "
-            "environments, operational impact or cost analysis of existing deployments, or 'what happens if', "
-            "'where is', or 'how is this currently managed' questions about an existing tenant."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "question": {
-                    "type": "string",
-                    "description": "The question to delegate to the ATM&A agent.",
-                },
-                "context": {
-                    "type": "string",
-                    "description": "Any additional context or background for the ATM&A agent.",
-                },
-            },
-            "required": ["question"],
-        },
-    },
+        "type": "url",
+        "url": "https://learn.microsoft.com/api/mcp",
+        "name": "microsoft-learn",
+    }
 ]
 
+# Required beta header for MCP client support
+BETA_HEADER = "mcp-client-2025-04-04"
+
 # ---------------------------------------------------------------------------
-# Tool implementations
+# ATM&A delegation
 # ---------------------------------------------------------------------------
 
+# Phrases that indicate the question is about EXISTING Azure resources or
+# live tenant configuration (per delegation rules in Atlas_Agent_Instructions.txt)
+ATMA_TRIGGER_PHRASES = [
+    "existing",
+    "deployed",
+    "currently running",
+    "already have",
+    "already deployed",
+    "my tenant",
+    "our tenant",
+    "my subscription",
+    "our subscription",
+    "management group",
+    "what happens if",
+    "where is",
+    "how is this currently",
+    "cost analysis",
+    "current cost",
+    "rbac",
+    "permissions on",
+    "policy impact",
+    "compliance status",
+    "existing deployments",
+]
 
-def microsoft_docs_search(query: str, locale: str = "en-us") -> str:
-    """Search Microsoft Learn documentation."""
-    params = {
-        "api-version": MS_LEARN_SEARCH_API_VERSION,
-        "search": query,
-        "locale": locale,
-        "$top": 10,
-    }
-    headers = {"Accept": "application/json"}
-
-    try:
-        response = requests.get(
-            MS_LEARN_SEARCH_URL, params=params, headers=headers, timeout=15
-        )
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as exc:
-        return f"Error searching Microsoft documentation: {exc}"
-
-    results = data.get("results", [])
-    if not results:
-        return "No official Microsoft documentation was found for this scenario."
-
-    lines = [f"Microsoft Learn Search Results for: '{query}'\n"]
-    for i, result in enumerate(results, 1):
-        title = result.get("title", "Untitled")
-        url = result.get("url", "")
-        description = result.get("description", "No description available.")
-        lines.append(f"{i}. **{title}**")
-        lines.append(f"   URL: {url}")
-        lines.append(f"   {description}\n")
-
-    return "\n".join(lines)
-
-
-def microsoft_docs_fetch(url: str) -> str:
-    """Fetch and extract the main content from a Microsoft Learn documentation page."""
-    if not url.startswith("https://learn.microsoft.com"):
-        return "Error: Only official Microsoft Learn URLs (https://learn.microsoft.com) are permitted."
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; Atlas-Agent/1.0)",
-        "Accept": "text/html,application/xhtml+xml",
-    }
-
-    try:
-        response = requests.get(url, headers=headers, timeout=20)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        return f"Error fetching Microsoft documentation page: {exc}"
-
-    soup = BeautifulSoup(response.text, "html.parser")
-
-    # Remove navigation, scripts, and style elements
-    for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-        tag.decompose()
-
-    # Try to find the main article content
-    main = (
-        soup.find("main")
-        or soup.find("article")
-        or soup.find(id="main-content")
-        or soup.find(class_="content")
-    )
-
-    if main:
-        text = main.get_text(separator="\n", strip=True)
-    else:
-        text = soup.get_text(separator="\n", strip=True)
-
-    # Collapse excessive blank lines
-    lines = [line for line in text.splitlines() if line.strip()]
-    content = "\n".join(lines)
-
-    # Truncate to avoid exceeding context limits
-    max_chars = 8000
-    if len(content) > max_chars:
-        content = content[:max_chars] + f"\n\n[Content truncated. Full page: {url}]"
-
-    return f"Content from {url}:\n\n{content}"
+# Non-Azure Microsoft products that should never trigger ATM&A delegation
+NON_AZURE_SIGNALS = [
+    "fabric",
+    "m365",
+    "microsoft 365",
+    "purview",
+    "copilot studio",
+    "power platform",
+    "sharepoint",
+    "teams",
+    "exchange",
+    "onelake",
+    "lakehouse",
+]
 
 
-def microsoft_code_sample_search(query: str) -> str:
-    """Search for official Microsoft/Azure code samples."""
-    params = {
-        "api-version": MS_LEARN_SEARCH_API_VERSION,
-        "search": query,
-        "locale": "en-us",
-        "category": "Sample",
-        "$top": 8,
-    }
-    headers = {"Accept": "application/json"}
-
-    try:
-        response = requests.get(
-            MS_LEARN_SEARCH_URL, params=params, headers=headers, timeout=15
-        )
-        response.raise_for_status()
-        data = response.json()
-    except requests.RequestException as exc:
-        return f"Error searching Microsoft code samples: {exc}"
-
-    results = data.get("results", [])
-    if not results:
-        # Fall back to a general search with "sample" appended
-        return microsoft_docs_search(f"{query} code sample quickstart")
-
-    lines = [f"Microsoft Official Code Samples for: '{query}'\n"]
-    for i, result in enumerate(results, 1):
-        title = result.get("title", "Untitled")
-        url = result.get("url", "")
-        description = result.get("description", "No description available.")
-        lines.append(f"{i}. **{title}**")
-        lines.append(f"   URL: {url}")
-        lines.append(f"   {description}\n")
-
-    return "\n".join(lines)
+def should_delegate_to_atma(user_message: str) -> bool:
+    """
+    Returns True when the message concerns existing Azure resources or live
+    tenant configuration, per the delegation rules in Atlas_Agent_Instructions.txt.
+    """
+    lower = user_message.lower()
+    # Non-Azure Microsoft products are never delegated
+    if any(signal in lower for signal in NON_AZURE_SIGNALS):
+        return False
+    return any(phrase in lower for phrase in ATMA_TRIGGER_PHRASES)
 
 
-def delegate_to_atma(question: str, context: str = "") -> str:
-    """Delegate a question about existing Azure resources to the ATM&A agent."""
-    print(
-        "\n[Atlas → ATM&A] Delegating to the Azure Tenant Management & Administration agent...\n"
-    )
-    delegation_message = (
-        "This question involves existing Azure resources or tenant configuration and has been "
-        "delegated to the ATM&A (Azure Tenant Management and Administration) agent, which has "
-        "access to live tenant data and operational context.\n\n"
-        f"Delegated question: {question}"
-    )
-    if context:
-        delegation_message += f"\nContext: {context}"
-
-    # In a full implementation, this would invoke the ATM&A agent via the Anthropic Agents API
-    # or another agent orchestration mechanism. For now, return a stub response.
+def delegate_to_atma(question: str) -> str:
+    """
+    Delegate a question to the ATM&A agent (stub).
+    In production, invoke the ATM&A agent via its API or SDK.
+    """
+    print("\n[Atlas → ATM&A] Delegating to the Azure Tenant Management & Administration agent...\n")
     return (
-        delegation_message
-        + "\n\n[ATM&A agent stub] This is a placeholder response. "
-        "In production, the ATM&A agent would query your Azure tenant and return live results."
+        "This question involves existing Azure resources or live tenant configuration. "
+        "I am delegating this to the ATM&A (Azure Tenant Management and Administration) agent, "
+        "which has direct access to your Azure environment.\n\n"
+        f"Delegated question: {question}\n\n"
+        "[ATM&A agent stub — integration not yet configured. "
+        "In production, the ATM&A agent will query your tenant and return live results.]"
     )
 
 
 # ---------------------------------------------------------------------------
-# Tool dispatch
+# Email delivery stub
 # ---------------------------------------------------------------------------
 
 
-def handle_tool_call(tool_name: str, tool_input: dict) -> str:
-    """Route a tool call to the appropriate implementation."""
-    if tool_name == "microsoft_docs_search":
-        return microsoft_docs_search(**tool_input)
-    elif tool_name == "microsoft_docs_fetch":
-        return microsoft_docs_fetch(**tool_input)
-    elif tool_name == "microsoft_code_sample_search":
-        return microsoft_code_sample_search(**tool_input)
-    elif tool_name == "delegate_to_atma":
-        return delegate_to_atma(**tool_input)
-    else:
-        return f"Unknown tool: {tool_name}"
+def send_email_stub(content: str) -> None:
+    """
+    Stub for email delivery after Atlas delivers a response.
+    Replace with Microsoft Graph API sendMail or SMTP integration.
+    """
+    # TODO: Implement via Microsoft Graph API (POST /me/sendMail)
+    print("[Email stub] Email delivery is not yet configured.")
 
 
 # ---------------------------------------------------------------------------
@@ -290,51 +132,53 @@ def handle_tool_call(tool_name: str, tool_input: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run_agentic_loop(client: anthropic.Anthropic, messages: list, system_prompt: str) -> None:
-    """Run the Atlas agentic loop until a final response is produced."""
-    while True:
-        response = client.messages.create(
+def run_agent_turn(
+    client: anthropic.Anthropic,
+    system_prompt: str,
+    messages: list,
+) -> str:
+    """
+    Run Atlas through the agentic loop for a single user turn.
+    The Anthropic MCP connector handles all tool discovery and execution
+    against the Microsoft Learn MCP server transparently.
+
+    Returns the final text response.
+    """
+    for _ in range(MAX_AGENTIC_ITERATIONS):
+        response = client.beta.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
             system=system_prompt,
-            tools=TOOLS,
             messages=messages,
+            mcp_servers=MCP_SERVERS,
+            betas=[BETA_HEADER],
         )
 
-        # Append the assistant response to history
+        # Append the full assistant response to history
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "end_turn":
-            # Print the final text response
             for block in response.content:
                 if hasattr(block, "text"):
-                    print(f"\nAtlas: {block.text}\n")
-            break
+                    return block.text
+            return ""
 
-        elif response.stop_reason == "tool_use":
-            # Process each tool call and collect results
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    print(f"  [Tool] {block.name}({json.dumps(block.input, ensure_ascii=False)[:120]}...)")
-                    result = handle_tool_call(block.name, block.input)
-                    tool_results.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": result,
-                        }
-                    )
+        if response.stop_reason in ("tool_use", "mcp_tool_use"):
+            # The Anthropic backend dispatches MCP tool calls to
+            # learn.microsoft.com/api/mcp and appends tool results —
+            # just loop to send the updated messages back.
+            continue
 
-            # Feed tool results back into the conversation
-            messages.append({"role": "user", "content": tool_results})
+        # Unexpected stop reason — surface any text and exit
+        for block in response.content:
+            if hasattr(block, "text"):
+                return block.text
+        break
 
-        else:
-            # Unexpected stop reason — surface any text and exit loop
-            for block in response.content:
-                if hasattr(block, "text"):
-                    print(f"\nAtlas: {block.text}\n")
-            break
+    return (
+        "[Atlas] Maximum reasoning steps reached for this query. "
+        "Please try rephrasing or breaking the question into smaller parts."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -374,17 +218,43 @@ def main() -> None:
             continue
 
         if user_input.lower() in ("exit", "quit"):
-            print("Session ended.")
+            print("Goodbye.")
             break
+
+        # Pre-flight ATM&A delegation check
+        if should_delegate_to_atma(user_input):
+            response_text = delegate_to_atma(user_input)
+            print(f"\nAtlas: {response_text}\n")
+            # Record delegation in history for context continuity
+            messages.append({"role": "user", "content": user_input})
+            messages.append(
+                {"role": "assistant", "content": [{"type": "text", "text": response_text}]}
+            )
+            continue
 
         messages.append({"role": "user", "content": user_input})
 
         try:
-            run_agentic_loop(client, messages, system_prompt)
+            response_text = run_agent_turn(client, system_prompt, messages)
         except anthropic.APIError as exc:
             print(f"\n[Error] Anthropic API error: {exc}\n")
+            messages.pop()  # remove failed user message to keep history clean
+            continue
         except Exception as exc:
             print(f"\n[Error] Unexpected error: {exc}\n")
+            messages.pop()
+            continue
+
+        print(f"\nAtlas: {response_text}\n")
+
+        # Optional email delivery (per Atlas_Agent_Instructions.txt lines 157-163)
+        try:
+            offer = input("Would you like me to email this to you? (yes/no): ").strip().lower()
+            if offer in ("yes", "y"):
+                send_email_stub(response_text)
+                print("Atlas: I've emailed this report to you.\n")
+        except (EOFError, KeyboardInterrupt):
+            print()
 
 
 if __name__ == "__main__":
